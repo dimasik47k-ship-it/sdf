@@ -156,20 +156,53 @@ async def process_callback(c: types.CallbackQuery, state: FSMContext):
 async def health_handler(request):
     return web.Response(text="OK")
 
+async def webhook_handler(request):
+    """Обработка входящих обновлений от Telegram"""
+    try:
+        update = types.Update.model_dump_json(await request.text())
+        await dp.feed_webhook_update(bot, types.Update.model_validate_json(update))
+        return web.Response(text="OK")
+    except Exception as e:
+        print(f"Webhook error: {e}")
+        return web.Response(text="Error", status=500)
+
+async def on_startup(app):
+    """Настройка вебхука при запуске"""
+    hostname = os.getenv("RENDER_EXTERNAL_HOSTNAME", "localhost")
+    webhook_url = f"https://{hostname}/webhook"
+    
+    await bot.set_webhook(
+        webhook_url,
+        drop_pending_updates=True,  # Пропустить старые сообщения при рестарте
+        allowed_updates=dp.resolve_used_update_types()  # Только нужные апдейты
+    )
+    print(f"✅ Webhook set: {webhook_url}")
+
+async def on_shutdown(app):
+    """Очистка вебхука при остановке"""
+    await bot.delete_webhook()
+    print("✅ Webhook deleted")
+
 async def main():
     await db_init()
 
+    # Регистрация хендлеров жизненного цикла
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
+
+    # Настройка aiohttp приложения
     app = web.Application()
-    app.router.add_get("/health", health_handler)
+    app.router.add_get("/health", health_handler)      # Для Render/UptimeRobot
+    app.router.add_post("/webhook", webhook_handler)   # Для Telegram
+
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 8080))).start()
 
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await bot.session.close()
-        await runner.cleanup()
+    print("🚀 Bot started (webhook mode)")
+    
+    # Держим процесс живым, пока не придёт сигнал остановки
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
     asyncio.run(main())
