@@ -203,11 +203,32 @@ async def main():
     await db_init()
     logger.info("✅ Database initialized")
     
-    # Регистрация хендлеров жизненного цикла
-    dp.startup.register(on_startup)
+    # 🔥 ЯВНАЯ установка вебхука ПЕРЕД запуском сервера
+    hostname = os.getenv("RENDER_EXTERNAL_HOSTNAME")
+    if not hostname:
+        # Fallback: попробуем получить из Render-метаданных или используем дефолт
+        logger.warning("⚠️ RENDER_EXTERNAL_HOSTNAME not set, trying fallback...")
+        hostname = os.getenv("HOSTNAME", "localhost")
+    
+    webhook_url = f"https://{hostname}/webhook"
+    logger.info(f"🔗 Setting webhook to: {webhook_url}")
+    
+    try:
+        await bot.set_webhook(
+            webhook_url,
+            drop_pending_updates=True,
+            allowed_updates=dp.resolve_used_update_types()
+        )
+        logger.info(f"✅ Webhook SET successfully: {webhook_url}")
+    except Exception as e:
+        logger.error(f"❌ CRITICAL: Failed to set webhook: {e}")
+        # Не выходим, пусть сервер запустится — может, переменная подгрузится позже
+    
+    # Регистрация хендлеров (для корректного shutdown)
+    dp.startup.register(on_startup)  # Можно оставить, но теперь это дубль
     dp.shutdown.register(on_shutdown)
     
-    # Настройка веб-сервера
+    # Запуск веб-сервера
     port = int(os.getenv("PORT", 8080))
     app = web.Application()
     app.router.add_get("/health", health_handler)
@@ -218,8 +239,8 @@ async def main():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     
-    logger.info(f"✅ Server started on port {port}")
-    logger.info(f"✅ Health: https://{os.getenv('RENDER_EXTERNAL_HOSTNAME', 'localhost')}/health")
+    logger.info(f"✅ Server listening on port {port}")
+    logger.info(f"✅ Health check: https://{hostname}/health")
     
     # Держим процесс живым
     await asyncio.Event().wait()
