@@ -1,28 +1,41 @@
-import asyncio
-import aiosqlite
 import os
-from aiogram import Bot, Dispatcher, types
+import asyncio
+import logging
+import aiosqlite
+from aiohttp import web
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
-from aiohttp import web
+from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
+import aiohttp
 
-# 🔐 Безопасная загрузка конфига из переменных окружения
+# 🔐 Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# 🔐 Загрузка конфига из окружения
 TOKEN = os.getenv("TOKEN")
 if not TOKEN:
-    raise RuntimeError("❌ Переменная окружения TOKEN не найдена!")
+    raise RuntimeError("❌ TOKEN not found in environment variables!")
 
 ADMINS_STR = os.getenv("ADMINS", "")
 ADMINS = {int(x.strip()) for x in ADMINS_STR.split(",") if x.strip().isdigit()}
 if not ADMINS:
-    raise RuntimeError("❌ Переменная окружения ADMINS не найдена! Формат: 123456789")
+    raise RuntimeError("❌ ADMINS not found! Format: 123456789")
 
 DB = "users.db"
-bot = Bot(token=TOKEN)
+
+# 🔐 Настройка сессии с таймаутами (важно для Render)
+timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_read=30)
+session = AiohttpSession(timeout=timeout)
+bot = Bot(token=TOKEN, session=session, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
+# ────────────── FSM ──────────────
 class Broadcast(StatesGroup):
     wait_msg = State()
 
@@ -60,8 +73,7 @@ async def cmd_start(m: types.Message):
             "📩 Вы подписаны на рассылку.\n"
             "🔔 Уведомления будут приходить сюда.\n"
             "━━━━━━━━━━━━━━━━━━\n"
-            "<i>Ожидайте важные обновления!</i>",
-            parse_mode="HTML"
+            "<i>Ожидайте важные обновления!</i>"
         )
 
 @dp.message(Command("ms"))
@@ -72,8 +84,7 @@ async def cmd_ms(m: types.Message, state: FSMContext):
         "━━━━━━━━━━━━━━━━━━\n"
         "Отправьте сообщение боту.\n"
         "✅ Поддерживается: текст, стикеры, GIF, видео,\n"
-        "   голосовые, альбомы, премиум-эмодзи.",
-        parse_mode="HTML"
+        "   голосовые, альбомы, премиум-эмодзи."
     )
     await state.set_state(Broadcast.wait_msg)
 
@@ -84,7 +95,7 @@ async def handle_broadcast(m: types.Message, state: FSMContext):
 
     users = await db_get()
     if not users:
-        return await m.answer("❌ <b>Нет подписчиков</b>", parse_mode="HTML")
+        return await m.answer("❌ <b>Нет подписчиков</b>")
 
     msgs = [m]
     if m.media_group_id:
@@ -97,14 +108,13 @@ async def handle_broadcast(m: types.Message, state: FSMContext):
     ])
 
     await m.answer(
-        f"📋 <b>Предпросмотр рассылки</b>\n"
+        f"📋 <b>Предпросмотр</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"👥 Подписчиков: <code>{len(users)}</code>\n"
         f"📦 Сообщений: <code>{len(msgs)}</code>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"Подтвердите отправку:",
-        reply_markup=kb,
-        parse_mode="HTML"
+        reply_markup=kb
     )
     await state.update_data(msgs=msgs, users=users, chat_id=m.chat.id)
 
@@ -114,18 +124,14 @@ async def process_callback(c: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     
     if c.data == "bc_cancel":
-        await c.message.edit_text("🛑 <b>Рассылка отменена</b>", parse_mode="HTML")
+        await c.message.edit_text("🛑 <b>Отменено</b>")
         await state.clear()
         return
 
     msgs, users, chat_id = data.get("msgs"), data.get("users"), data.get("chat_id")
     if not msgs: return
 
-    await c.message.edit_text(
-        "🚀 <b>Запуск...</b>\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "⏳ Не закрывайте окно. Это займёт время."
-    )
+    await c.message.edit_text("🚀 <b>Запуск...</b>\n━━━━━━━━━━━━━━━━━━\n⏳ Не закрывайте окно.")
 
     ok = block = fail = 0
     for uid in users:
@@ -141,68 +147,85 @@ async def process_callback(c: types.CallbackQuery, state: FSMContext):
             fail += 1
 
     await c.message.edit_text(
-        "✨ <b>Рассылка завершена</b>\n"
-        "━━━━━━━━━━━━━━━━━━\n"
+        f"✨ <b>Готово</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
         f"✅ Доставлено: <code>{ok}</code>\n"
         f"🚫 Заблокировали: <code>{block}</code>\n"
-        f"⚠️ Ошибки: <code>{fail}</code>\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "<i>Готово к следующей рассылке</i>",
-        parse_mode="HTML"
+        f"⚠️ Ошибки: <code>{fail}</code>"
     )
     await state.clear()
 
-# ────────────── Запуск (Render-Ready) ──────────────
+# ────────────── Webhook Handlers ──────────────
 async def health_handler(request):
     return web.Response(text="OK")
 
 async def webhook_handler(request):
-    """Обработка входящих обновлений от Telegram"""
     try:
-        update = types.Update.model_dump_json(await request.text())
-        await dp.feed_webhook_update(bot, types.Update.model_validate_json(update))
+        body = await request.text()
+        update = types.Update.model_validate_json(body)
+        await dp.feed_webhook_update(bot, update)
         return web.Response(text="OK")
     except Exception as e:
-        print(f"Webhook error: {e}")
+        logger.error(f"Webhook error: {e}")
         return web.Response(text="Error", status=500)
 
 async def on_startup(app):
-    """Настройка вебхука при запуске"""
-    hostname = os.getenv("RENDER_EXTERNAL_HOSTNAME", "localhost")
+    """Устанавливаем вебхук при старте"""
+    hostname = os.getenv("RENDER_EXTERNAL_HOSTNAME")
+    if not hostname:
+        logger.warning("⚠️ RENDER_EXTERNAL_HOSTNAME not set, using localhost")
+        hostname = "localhost"
+    
     webhook_url = f"https://{hostname}/webhook"
     
-    await bot.set_webhook(
-        webhook_url,
-        drop_pending_updates=True,  # Пропустить старые сообщения при рестарте
-        allowed_updates=dp.resolve_used_update_types()  # Только нужные апдейты
-    )
-    print(f"✅ Webhook set: {webhook_url}")
+    try:
+        await bot.set_webhook(
+            webhook_url,
+            drop_pending_updates=True,
+            allowed_updates=dp.resolve_used_update_types()
+        )
+        logger.info(f"✅ Webhook set: {webhook_url}")
+    except Exception as e:
+        logger.error(f"❌ Failed to set webhook: {e}")
 
 async def on_shutdown(app):
-    """Очистка вебхука при остановке"""
-    await bot.delete_webhook()
-    print("✅ Webhook deleted")
+    """Удаляем вебхук при остановке"""
+    try:
+        await bot.delete_webhook()
+        logger.info("✅ Webhook deleted")
+    except Exception as e:
+        logger.error(f"❌ Failed to delete webhook: {e}")
 
+# ────────────── Main ──────────────
 async def main():
+    logger.info("🚀 Starting bot...")
+    
     await db_init()
-
+    logger.info("✅ Database initialized")
+    
     # Регистрация хендлеров жизненного цикла
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
-
-    # Настройка aiohttp приложения
+    
+    # Настройка веб-сервера
+    port = int(os.getenv("PORT", 8080))
     app = web.Application()
-    app.router.add_get("/health", health_handler)      # Для Render/UptimeRobot
-    app.router.add_post("/webhook", webhook_handler)   # Для Telegram
-
+    app.router.add_get("/health", health_handler)
+    app.router.add_post("/webhook", webhook_handler)
+    
     runner = web.AppRunner(app)
     await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 8080))).start()
-
-    print("🚀 Bot started (webhook mode)")
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
     
-    # Держим процесс живым, пока не придёт сигнал остановки
+    logger.info(f"✅ Server started on port {port}")
+    logger.info(f"✅ Health: https://{os.getenv('RENDER_EXTERNAL_HOSTNAME', 'localhost')}/health")
+    
+    # Держим процесс живым
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("👋 Bot stopped by user")
