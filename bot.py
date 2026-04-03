@@ -1,16 +1,20 @@
 import asyncio
 import aiosqlite
 import os
+import logging
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
+from aiogram.exceptions import TelegramForbiddenError
 from aiogram.enums import ContentType, ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiohttp import web
 import html
+
+# Включаем логирование, чтобы видеть возможные ошибки в консоли
+logging.basicConfig(level=logging.INFO)
 
 # 🔐 Безопасная загрузка конфига
 TOKEN = os.getenv("TOKEN")
@@ -33,18 +37,23 @@ class Broadcast(StatesGroup):
 # ────────────── БД ──────────────
 async def db_init():
     async with aiosqlite.connect(DB) as db:
-        # Сохраняем все нужные данные при старте, чтобы не дергать API при рассылке
+        # Создаем таблицу, если ее нет
         await db.execute("""
             CREATE TABLE IF NOT EXISTS subs (
-                uid INTEGER PRIMARY KEY,
-                first_name TEXT,
-                last_name TEXT,
-                username TEXT,
-                language_code TEXT,
-                is_premium BOOLEAN,
-                is_bot BOOLEAN
+                uid INTEGER PRIMARY KEY
             )
         """)
+        # Автоматическое обновление структуры БД (если осталась старая версия базы)
+        try:
+            await db.execute("ALTER TABLE subs ADD COLUMN first_name TEXT DEFAULT ''")
+            await db.execute("ALTER TABLE subs ADD COLUMN last_name TEXT DEFAULT ''")
+            await db.execute("ALTER TABLE subs ADD COLUMN username TEXT DEFAULT ''")
+            await db.execute("ALTER TABLE subs ADD COLUMN language_code TEXT DEFAULT ''")
+            await db.execute("ALTER TABLE subs ADD COLUMN is_premium BOOLEAN DEFAULT 0")
+            await db.execute("ALTER TABLE subs ADD COLUMN is_bot BOOLEAN DEFAULT 0")
+        except Exception:
+            pass  # Если колонки уже есть, ошибка игнорируется
+            
         await db.commit()
 
 async def db_add_user(user: types.User):
@@ -74,14 +83,12 @@ async def db_get_users():
     async with aiosqlite.connect(DB) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM subs") as cur:
-            # Возвращаем список словарей с данными пользователей
             return [dict(row) for row in await cur.fetchall()]
 
 async def db_remove(uid: int):
     async with aiosqlite.connect(DB) as db:
         await db.execute("DELETE FROM subs WHERE uid = ?", (uid,))
         await db.commit()
-
 
 # ────────────── Утилиты для текста ──────────────
 def build_placeholders(user_info: dict) -> dict:
@@ -94,7 +101,6 @@ def build_placeholders(user_info: dict) -> dict:
     lang = user_info.get("language_code", "")
     full_name = f"{first_name} {last_name}".strip() if last_name else first_name
     
-    # Кликабельное упоминание (имя с ссылкой на профиль), если нет юзернейма
     if username:
         mention = f"@{username}"
     else:
@@ -123,7 +129,6 @@ def personalize_text(text: str, placeholders: dict) -> str:
     
     sorted_placeholders = sorted(placeholders.items(), key=lambda x: len(x[0]), reverse=True)
     for placeholder, value in sorted_placeholders:
-        # Не экранируем {mention}, так как он уже содержит валидный HTML
         if placeholder == "{mention}":
             text = text.replace(placeholder, str(value))
         else:
@@ -149,9 +154,7 @@ async def cmd_start(m: types.Message):
             "✨ <b>Добро пожаловать!</b>\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "📩 Вы подписаны на рассылку.\n"
-            "🔔 Уведомления будут приходить сюда.\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            "<i>Ожидайте важные обновления!</i>"
+            "🔔 Уведомления будут приходить сюда."
         )
     else:
         await m.answer("✅ Данные обновлены. Вы уже подписаны на рассылку.")
@@ -162,8 +165,7 @@ async def cmd_ms(m: types.Message, state: FSMContext):
     await m.answer(
         "📤 <b>Режим рассылки</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "Отправьте сообщение боту.\n"
-        "⚠️ <i>Медиагруппы (альбомы) в режиме рассылки с плейсхолдерами отправляются по одному фото. Для альбома лучше использовать рассылку без переменных.</i>"
+        "Отправьте сообщение боту."
     )
     await state.set_state(Broadcast.wait_msg)
 
@@ -174,7 +176,7 @@ async def handle_broadcast(m: types.Message, state: FSMContext):
 
     users = await db_get_users()
     if not users:
-        return await m.answer("❌ <b>Нет подписчиков</b>")
+        return await m.answer("❌ <b>Нет подписчиков.</b> Отправьте /start чтобы подписаться.")
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Отправить всем", callback_data="bc_confirm")],
@@ -190,8 +192,27 @@ async def handle_broadcast(m: types.Message, state: FSMContext):
         reply_markup=kb
     )
     
-    # Сохраняем ID сообщения для копирования (если нет плейсхолдеров)
-    await state.update_data(msg_id=m.message_id, chat_id=m.chat.id, users=users)
+    # 💡 НОВЫЙ МЕХАНИЗМ: Сохраняем все нужные данные сразу, без пересылки
+    original_html_text = m.html_text or ""
+    needs_personalization = has_placeholders(original_html_text)
+    
+    # Извлекаем ID файла медиа, если оно есть
+    file_id = None
+    if m.photo: file_id = m.photo[-1].file_id
+    elif m.video: file_id = m.video.file_id
+    elif m.document: file_id = m.document.file_id
+    elif m.animation: file_id = m.animation.file_id
+    elif m.audio: file_id = m.audio.file_id
+
+    await state.update_data(
+        msg_id=m.message_id,
+        chat_id=m.chat.id,
+        users=users,
+        needs_personalization=needs_personalization,
+        original_html_text=original_html_text,
+        content_type=m.content_type.value if hasattr(m.content_type, 'value') else m.content_type,
+        file_id=file_id
+    )
 
 @dp.callback_query(F.data.startswith("bc_"))
 async def process_callback(c: types.CallbackQuery, state: FSMContext):
@@ -206,58 +227,55 @@ async def process_callback(c: types.CallbackQuery, state: FSMContext):
     msg_id = data.get("msg_id")
     chat_id = data.get("chat_id")
     users = data.get("users")
-    if not msg_id: return
+    needs_personalization = data.get("needs_personalization")
+    original_html_text = data.get("original_html_text")
+    content_type = data.get("content_type")
+    file_id = data.get("file_id")
 
-    # Получаем само сообщение для анализа
-    try:
-        msg = await bot.forward_message(chat_id=chat_id, from_chat_id=chat_id, message_id=msg_id)
-        await msg.delete() # Удаляем форвард, нам нужен был только объект сообщения
-    except Exception:
-        await c.message.edit_text("❌ Ошибка: не удалось получить оригинальное сообщение.")
+    if not users:
+        await c.message.edit_text("❌ Ошибка: данные утеряны, начните заново.")
         return
 
     await c.message.edit_text("🚀 <b>Запуск...</b>\n━━━━━━━━━━━━━━━━━━\n⏳ Не закрывайте окно.")
 
     ok = block = fail = 0
     
-    # Aiogram 3: html_text сохраняет всё форматирование (жирный, ссылки и т.д.)
-    original_html_text = msg.html_text if hasattr(msg, 'html_text') and msg.html_text else ""
-    needs_personalization = has_placeholders(original_html_text)
-    
     for user in users:
         uid = user["uid"]
         try:
+            # 1. Если нет плейсхолдеров, просто копируем 1 в 1
             if not needs_personalization:
-                # САМЫЙ НАДЕЖНЫЙ МЕТОД: Если плейсхолдеров нет, просто копируем сообщение
-                # Это сохранит кнопки, форматирование, скрытый текст и т.д.
                 await bot.copy_message(chat_id=uid, from_chat_id=chat_id, message_id=msg_id)
+            
+            # 2. Если есть переменные — подставляем и отправляем конкретный тип медиа
             else:
-                # Если нужны плейсхолдеры, собираем их из данных БД
                 placeholders = build_placeholders(user)
                 final_text = personalize_text(original_html_text, placeholders)
 
-                if msg.content_type == ContentType.TEXT:
+                if content_type == ContentType.TEXT:
                     await bot.send_message(uid, final_text)
-                elif msg.content_type == ContentType.PHOTO:
-                    await bot.send_photo(uid, msg.photo[-1].file_id, caption=final_text)
-                elif msg.content_type == ContentType.VIDEO:
-                    await bot.send_video(uid, msg.video.file_id, caption=final_text)
-                elif msg.content_type == ContentType.DOCUMENT:
-                    await bot.send_document(uid, msg.document.file_id, caption=final_text)
-                elif msg.content_type == ContentType.ANIMATION:
-                    await bot.send_animation(uid, msg.animation.file_id, caption=final_text)
+                elif content_type == ContentType.PHOTO:
+                    await bot.send_photo(uid, file_id, caption=final_text)
+                elif content_type == ContentType.VIDEO:
+                    await bot.send_video(uid, file_id, caption=final_text)
+                elif content_type == ContentType.DOCUMENT:
+                    await bot.send_document(uid, file_id, caption=final_text)
+                elif content_type == ContentType.ANIMATION:
+                    await bot.send_animation(uid, file_id, caption=final_text)
+                elif content_type == ContentType.AUDIO:
+                    await bot.send_audio(uid, file_id, caption=final_text)
                 else:
-                    # Фоллбек для голосовых, кружков и стикеров (не поддерживают текст с плейсхолдерами)
+                    # Фоллбэк (кружки/голосовые не поддерживают текст с переменными)
                     await bot.copy_message(chat_id=uid, from_chat_id=chat_id, message_id=msg_id)
 
             ok += 1
-            await asyncio.sleep(0.035) # ~28 сообщений в секунду, безопасно для лимитов
+            await asyncio.sleep(0.04) # Безопасная пауза от блокировки
             
         except TelegramForbiddenError:
             block += 1
             await db_remove(uid)
         except Exception as e:
-            print(f"Error sending to {uid}: {e}")
+            logging.error(f"Ошибка отправки {uid}: {e}")
             fail += 1
 
     await c.message.edit_text(
@@ -271,7 +289,6 @@ async def process_callback(c: types.CallbackQuery, state: FSMContext):
     )
     await state.clear()
 
-
 # ────────────── Webhook и запуск (Render-Ready) ──────────────
 async def health_handler(request):
     return web.Response(text="OK")
@@ -283,13 +300,14 @@ async def webhook_handler(request: web.Request):
         await dp.feed_webhook_update(bot, update)
         return web.Response(text="OK")
     except Exception as e:
-        print(f"❌ Webhook error: {e}")
+        logging.error(f"❌ Webhook error: {e}")
         return web.Response(text="Error", status=500)
 
 async def on_startup(app):
     hostname = os.getenv("RENDER_EXTERNAL_HOSTNAME")
     if not hostname:
-        raise RuntimeError("❌ RENDER_EXTERNAL_HOSTNAME не найден!")
+        logging.error("❌ RENDER_EXTERNAL_HOSTNAME не найден!")
+        return
     
     webhook_url = f"https://{hostname}/webhook"
     
@@ -298,16 +316,15 @@ async def on_startup(app):
         drop_pending_updates=True,
         allowed_updates=dp.resolve_used_update_types()
     )
-    print(f"✅ Webhook set: {webhook_url}")
+    logging.info(f"✅ Webhook set: {webhook_url}")
 
 async def on_shutdown(app):
     await bot.delete_webhook()
-    print("✅ Webhook deleted")
+    logging.info("✅ Webhook deleted")
 
 async def main():
     await db_init()
 
-    # Настройка aiohttp
     app = web.Application()
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_shutdown)
@@ -320,7 +337,7 @@ async def main():
     port = int(os.getenv("PORT", 8080))
     await web.TCPSite(runner, "0.0.0.0", port).start()
 
-    print(f"🚀 Bot started on port {port}")
+    logging.info(f"🚀 Bot started on port {port}")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
