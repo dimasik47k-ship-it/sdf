@@ -9,6 +9,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
 from aiogram.enums import ContentType
 from aiohttp import web
+import html
 
 # 🔐 Безопасная загрузка конфига из переменных окружения
 TOKEN = os.getenv("TOKEN")
@@ -119,10 +120,24 @@ def build_placeholders(chat_info: dict) -> dict:
     }
 
 
+
+
 def personalize_text(text: str, placeholders: dict) -> str:
-    """Заменяет все плейсхолдеры в тексте на значения."""
-    for placeholder, value in placeholders.items():
-        text = text.replace(placeholder, value)
+    """
+    Заменяет все плейсхолдеры в тексте на значения.
+    1. Сортируем ключи по длине (убывание), чтобы {name:lower} заменился раньше {name}.
+    2. Экранируем значения для безопасной вставки в HTML.
+    """
+    if not text:
+        return text
+        
+    # Сортировка: сначала длинные плейсхолдеры
+    sorted_placeholders = sorted(placeholders.items(), key=lambda x: len(x[0]), reverse=True)
+    
+    for placeholder, value in sorted_placeholders:
+        # Экранируем HTML-символы в значении, чтобы не сломать разметку
+        safe_value = html.escape(str(value))
+        text = text.replace(placeholder, safe_value)
     return text
 
 
@@ -278,93 +293,85 @@ async def process_callback(c: types.CallbackQuery, state: FSMContext):
         for msg in msgs
     )
     
+        # ... (код до цикла for uid in users) ...
+    
     for uid in users:
         try:
-            # Получаем информацию о пользователе если нужна персонализация
-            user_info = {}
+            # Получаем инфо пользователя только если есть плейсхолдеры
+            placeholders = {}
             if needs_personalization:
                 user_info = await get_user_info(bot, uid)
                 placeholders = build_placeholders(user_info)
             
-            for msg in msgs:
-                msg_text = msg.text or msg.caption or ""
+            # Определяем, является ли текущая пачка сообщений медиа-группой
+            is_media_group = len(msgs) > 1 and msgs[0].media_group_id
+            
+            # Если это альбом, готовим группу для отправки (aiogram 3.x)
+            if is_media_group and needs_personalization:
+                from aiogram.types import InputMediaPhoto, InputMediaVideo, InputMediaAudio, InputMediaDocument
+                media_group = []
                 
-                if needs_personalization and has_placeholders(msg_text):
-                    # Персонализированная отправка
-                    placeholders = build_placeholders(user_info)
-                    personalized_text = personalize_text(msg_text, placeholders)
+                for msg in msgs:
+                    original_text = msg.text or msg.caption or ""
+                    new_caption = personalize_text(original_text, placeholders) if has_placeholders(original_text) else original_text
                     
+                    # Формируем объекты InputMedia* с новыми подписями
+                    if msg.content_type == ContentType.PHOTO:
+                        media_group.append(InputMediaPhoto(media=msg.photo[-1].file_id, caption=new_caption, parse_mode="HTML"))
+                    elif msg.content_type == ContentType.VIDEO:
+                        media_group.append(InputMediaVideo(media=msg.video.file_id, caption=new_caption, parse_mode="HTML"))
+                    elif msg.content_type == ContentType.DOCUMENT:
+                        media_group.append(InputMediaDocument(media=msg.document.file_id, caption=new_caption, parse_mode="HTML"))
+                    elif msg.content_type == ContentType.AUDIO:
+                        media_group.append(InputMediaAudio(media=msg.audio.file_id, caption=new_caption, parse_mode="HTML"))
+                    else:
+                        # Если тип не поддерживается в альбоме, отправим отдельно ниже
+                        media_group = None 
+                        break
+                
+                if media_group:
+                    try:
+                        await bot.send_media_group(uid, media_group)
+                        await asyncio.sleep(0.035)
+                        continue # Переходим к следующему пользователю
+                    except Exception as e:
+                        print(f"Error sending media group to {uid}: {e}")
+                        # Фоллбэк: отправлять по одному, если группа не прошла
+
+            # --- Стандартная отправка (одиночные сообщения или фоллбэк) ---
+            for msg in msgs:
+                original_text = msg.text or msg.caption or ""
+                
+                # Определяем финальный текст и parse_mode
+                if needs_personalization and has_placeholders(original_text):
+                    final_text = personalize_text(original_text, placeholders)
+                    parse_mode = "HTML"
+                else:
+                    # Если персонализация не нужна, копируем как есть
+                    final_text = original_text
+                    parse_mode = msg.parse_mode if hasattr(msg, 'parse_mode') else None
+
+                try:
                     if msg.content_type == ContentType.TEXT:
-                        # Текстовое сообщение
-                        try:
-                            await bot.send_message(uid, personalized_text, parse_mode="HTML")
-                        except TelegramBadRequest as e:
-                            if "can't parse" in str(e).lower():
-                                await bot.send_message(uid, personalized_text)
-                            else:
-                                raise
+                        await bot.send_message(uid, final_text, parse_mode=parse_mode)
                     
                     elif msg.content_type == ContentType.PHOTO:
-                        try:
-                            await bot.send_photo(
-                                uid, msg.photo[-1].file_id,
-                                caption=personalized_text, parse_mode="HTML"
-                            )
-                        except TelegramBadRequest as e:
-                            if "can't parse" in str(e).lower():
-                                await bot.send_photo(uid, msg.photo[-1].file_id, caption=personalized_text)
-                            else:
-                                raise
+                        await bot.send_photo(uid, msg.photo[-1].file_id, caption=final_text, parse_mode=parse_mode)
                     
                     elif msg.content_type == ContentType.VIDEO:
-                        try:
-                            await bot.send_video(
-                                uid, msg.video.file_id,
-                                caption=personalized_text, parse_mode="HTML"
-                            )
-                        except TelegramBadRequest as e:
-                            if "can't parse" in str(e).lower():
-                                await bot.send_video(uid, msg.video.file_id, caption=personalized_text)
-                            else:
-                                raise
+                        await bot.send_video(uid, msg.video.file_id, caption=final_text, parse_mode=parse_mode)
                     
                     elif msg.content_type == ContentType.DOCUMENT:
-                        try:
-                            await bot.send_document(
-                                uid, msg.document.file_id,
-                                caption=personalized_text, parse_mode="HTML"
-                            )
-                        except TelegramBadRequest as e:
-                            if "can't parse" in str(e).lower():
-                                await bot.send_document(uid, msg.document.file_id, caption=personalized_text)
-                            else:
-                                raise
+                        await bot.send_document(uid, msg.document.file_id, caption=final_text, parse_mode=parse_mode)
                     
                     elif msg.content_type == ContentType.AUDIO:
-                        try:
-                            await bot.send_audio(
-                                uid, msg.audio.file_id,
-                                caption=personalized_text, parse_mode="HTML"
-                            )
-                        except TelegramBadRequest as e:
-                            if "can't parse" in str(e).lower():
-                                await bot.send_audio(uid, msg.audio.file_id, caption=personalized_text)
-                            else:
-                                raise
+                        await bot.send_audio(uid, msg.audio.file_id, caption=final_text, parse_mode=parse_mode)
                     
-                    elif msg.content_type == ContentType.ANIMATION:
-                        try:
-                            await bot.send_animation(
-                                uid, msg.animation.file_id,
-                                caption=personalized_text, parse_mode="HTML"
-                            )
-                        except TelegramBadRequest as e:
-                            if "can't parse" in str(e).lower():
-                                await bot.send_animation(uid, msg.animation.file_id, caption=personalized_text)
-                            else:
-                                raise
+                    elif msg.content_type == ContentType.ANIMATION: # GIF
+                        await bot.send_animation(uid, msg.animation.file_id, caption=final_text, parse_mode=parse_mode)
                     
                     elif msg.content_type == ContentType.VOICE:
+                        # Голосовые не поддерживают подписи с HTML, отправляем как есть
                         await bot.send_voice(uid, msg.voice.file_id)
                     
                     elif msg.content_type == ContentType.VIDEO_NOTE:
@@ -374,19 +381,34 @@ async def process_callback(c: types.CallbackQuery, state: FSMContext):
                         await bot.send_sticker(uid, msg.sticker.file_id)
                     
                     else:
-                        # Фоллбэк — обычное копирование
+                        # Для всех остальных типов (контакты, геометрия и т.д.) 
+                        # персонализация текста невозможна через API, используем copy
                         await bot.copy_message(uid, chat_id, msg.message_id)
-                
-                else:
-                    # Без персонализации — просто копируем
-                    await bot.copy_message(uid, chat_id, msg.message_id)
-                
-                await asyncio.sleep(0.035)
+                    
+                    # Небольшая задержка, чтобы не словить лимиты (429)
+                    await asyncio.sleep(0.035)
+                    
+                except TelegramBadRequest as e:
+                    # Если HTML не валиден (редкий кейс), пробуем отправить без парсинга
+                    if "can't parse" in str(e).lower() and parse_mode:
+                        if msg.content_type == ContentType.PHOTO:
+                            await bot.send_photo(uid, msg.photo[-1].file_id, caption=final_text)
+                        elif msg.content_type == ContentType.VIDEO:
+                            await bot.send_video(uid, msg.video.file_id, caption=final_text)
+                        elif msg.content_type == ContentType.TEXT:
+                            await bot.send_message(uid, final_text)
+                        else:
+                            await bot.copy_message(uid, chat_id, msg.message_id)
+                    else:
+                        raise
+                        
             ok += 1
+            
         except TelegramForbiddenError:
             block += 1
             await db_remove(uid)
-        except (TelegramBadRequest, Exception):
+        except Exception as e:
+            print(f"Error sending to {uid}: {e}")
             fail += 1
 
     await c.message.edit_text(
