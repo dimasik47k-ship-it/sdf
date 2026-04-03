@@ -1,43 +1,173 @@
-import os
 import asyncio
-import logging
 import aiosqlite
-from aiohttp import web
-from aiogram import Bot, Dispatcher, types, F
+import os
+from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
-from aiogram.client.default import DefaultBotProperties
-from aiogram.client.session.aiohttp import AiohttpSession
-import aiohttp
+from aiogram.enums import ContentType
+from aiohttp import web
 
-# 🔐 Настройка логирования
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# 🔐 Загрузка конфига из окружения
+# 🔐 Безопасная загрузка конфига из переменных окружения
 TOKEN = os.getenv("TOKEN")
 if not TOKEN:
-    raise RuntimeError("❌ TOKEN not found in environment variables!")
+    raise RuntimeError("❌ Переменная окружения TOKEN не найдена!")
 
 ADMINS_STR = os.getenv("ADMINS", "")
 ADMINS = {int(x.strip()) for x in ADMINS_STR.split(",") if x.strip().isdigit()}
 if not ADMINS:
-    raise RuntimeError("❌ ADMINS not found! Format: 123456789")
+    raise RuntimeError("❌ Переменная окружения ADMINS не найдена! Формат: 123456789")
 
 DB = "users.db"
-
-# 🔐 Настройка сессии с таймаутами (важно для Render)
-timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_read=30)
-session = AiohttpSession(timeout=timeout)
-bot = Bot(token=TOKEN, session=session, default=DefaultBotProperties(parse_mode="HTML"))
+bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# ────────────── FSM ──────────────
 class Broadcast(StatesGroup):
     wait_msg = State()
+
+# ────────────── Утилиты ──────────────
+def build_placeholders(chat_info: dict) -> dict:
+    """
+    Строит словарь всех плейсхолдеров из информации о пользователе.
+    
+    Доступные плейсхолдеры:
+    {name} / {first_name} — имя пользователя (с заглавной первой буквой)
+    {last_name} — фамилия (если есть)
+    {full_name} — полное имя (имя + фамилия)
+    {username} — юзернейм (без @)
+    {username_at} — юзернейм с @
+    {id} — Telegram ID пользователя
+    {name:lower} / {first_name:lower} — имя строчными
+    {name:upper} / {first_name:upper} — имя заглавными
+    {last_name:lower} — фамилия строчными
+    {last_name:upper} — фамилия заглавными
+    {full_name:lower} — полное имя строчными
+    {full_name:upper} — полное имя заглавными
+    {premium} — True/False (подписка Telegram Premium)
+    {premium_emoji} — ⭐ / ☆ (иконка премиума)
+    {premium_badge} — 🌟 / "" (звёздочка для рассылки)
+    {is_bot} — True/False (является ли ботом)
+    {chat_id} — ID чата (совпадает с id для личных сообщений)
+    {chat_type} — private / public
+    {mention} — упоминание (через @ или имя)
+    {lang} — языковой код пользователя
+    """
+    first_name = chat_info.get("first_name", "Пользователь")
+    last_name = chat_info.get("last_name", "")
+    username = chat_info.get("username", "")
+    uid = chat_info.get("id", 0)
+    is_premium = chat_info.get("is_premium", False)
+    is_bot = chat_info.get("is_bot", False)
+    lang = chat_info.get("language_code", "")
+    full_name = f"{first_name} {last_name}".strip() if last_name else first_name
+    
+    # Определяем тип чата
+    chat_type = chat_info.get("chat_type", "private")
+    chat_type_display = "private" if chat_type == "private" else "public"
+    
+    # Mention
+    if username:
+        mention = f"@{username}"
+    else:
+        mention = first_name
+    
+    return {
+        # Имя
+        "{name}": first_name,
+        "{first_name}": first_name,
+        "{name:lower}": first_name.lower(),
+        "{first_name:lower}": first_name.lower(),
+        "{name:upper}": first_name.upper(),
+        "{first_name:upper}": first_name.upper(),
+        
+        # Фамилия
+        "{last_name}": last_name,
+        "{last_name:lower}": last_name.lower(),
+        "{last_name:upper}": last_name.upper(),
+        
+        # Полное имя
+        "{full_name}": full_name,
+        "{full_name:lower}": full_name.lower(),
+        "{full_name:upper}": full_name.upper(),
+        
+        # Юзернейм
+        "{username}": username,
+        "{username_at}": f"@{username}" if username else "",
+        
+        # ID
+        "{id}": str(uid),
+        "{chat_id}": str(uid),
+        
+        # Премиум
+        "{premium}": str(is_premium),
+        "{premium_emoji}": "⭐" if is_premium else "☆",
+        "{premium_badge}": "🌟" if is_premium else "",
+        
+        # Бот
+        "{is_bot}": str(is_bot),
+        
+        # Тип чата
+        "{chat_type}": chat_type_display,
+        
+        # Упоминание
+        "{mention}": mention,
+        
+        # Язык
+        "{lang}": lang,
+    }
+
+
+def personalize_text(text: str, placeholders: dict) -> str:
+    """Заменяет все плейсхолдеры в тексте на значения."""
+    for placeholder, value in placeholders.items():
+        text = text.replace(placeholder, value)
+    return text
+
+
+async def get_user_info(bot: Bot, uid: int) -> dict:
+    """Получает полнуюбую информацию о пользователе."""
+    try:
+        chat = await bot.get_chat(uid)
+        return {
+            "id": chat.id,
+            "first_name": chat.first_name or "",
+            "last_name": chat.last_name or "",
+            "username": chat.username or "",
+            "is_premium": chat.is_premium_user or False,
+            "is_bot": chat.is_bot or False,
+            "language_code": chat.language_code or "",
+            "chat_type": chat.type or "private",
+        }
+    except Exception:
+        return {
+            "id": uid,
+            "first_name": "Пользователь",
+            "last_name": "",
+            "username": "",
+            "is_premium": False,
+            "is_bot": False,
+            "language_code": "",
+            "chat_type": "private",
+        }
+
+
+ALL_PLACEHOLDERS = [
+    "{name}", "{first_name}", "{name:lower}", "{first_name:lower}",
+    "{name:upper}", "{first_name:upper}", "{last_name}", "{last_name:lower}",
+    "{last_name:upper}", "{full_name}", "{full_name:lower}", "{full_name:upper}",
+    "{username}", "{username_at}", "{id}", "{chat_id}", "{premium}",
+    "{premium_emoji}", "{premium_badge}", "{is_bot}", "{chat_type}",
+    "{mention}", "{lang}",
+]
+
+
+def has_placeholders(text: str) -> bool:
+    """Проверяет, есть ли в тексте плейсхолдеры."""
+    if not text:
+        return False
+    return any(ph in text for ph in ALL_PLACEHOLDERS)
 
 # ────────────── БД ──────────────
 async def db_init():
@@ -73,7 +203,8 @@ async def cmd_start(m: types.Message):
             "📩 Вы подписаны на рассылку.\n"
             "🔔 Уведомления будут приходить сюда.\n"
             "━━━━━━━━━━━━━━━━━━\n"
-            "<i>Ожидайте важные обновления!</i>"
+            "<i>Ожидайте важные обновления!</i>",
+            parse_mode="HTML"
         )
 
 @dp.message(Command("ms"))
@@ -84,7 +215,8 @@ async def cmd_ms(m: types.Message, state: FSMContext):
         "━━━━━━━━━━━━━━━━━━\n"
         "Отправьте сообщение боту.\n"
         "✅ Поддерживается: текст, стикеры, GIF, видео,\n"
-        "   голосовые, альбомы, премиум-эмодзи."
+        "   голосовые, альбомы, премиум-эмодзи.",
+        parse_mode="HTML"
     )
     await state.set_state(Broadcast.wait_msg)
 
@@ -95,7 +227,7 @@ async def handle_broadcast(m: types.Message, state: FSMContext):
 
     users = await db_get()
     if not users:
-        return await m.answer("❌ <b>Нет подписчиков</b>")
+        return await m.answer("❌ <b>Нет подписчиков</b>", parse_mode="HTML")
 
     msgs = [m]
     if m.media_group_id:
@@ -108,13 +240,14 @@ async def handle_broadcast(m: types.Message, state: FSMContext):
     ])
 
     await m.answer(
-        f"📋 <b>Предпросмотр</b>\n"
+        f"📋 <b>Предпросмотр рассылки</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"👥 Подписчиков: <code>{len(users)}</code>\n"
         f"📦 Сообщений: <code>{len(msgs)}</code>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"Подтвердите отправку:",
-        reply_markup=kb
+        reply_markup=kb,
+        parse_mode="HTML"
     )
     await state.update_data(msgs=msgs, users=users, chat_id=m.chat.id)
 
@@ -124,20 +257,130 @@ async def process_callback(c: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     
     if c.data == "bc_cancel":
-        await c.message.edit_text("🛑 <b>Отменено</b>")
+        await c.message.edit_text("🛑 <b>Рассылка отменена</b>", parse_mode="HTML")
         await state.clear()
         return
 
     msgs, users, chat_id = data.get("msgs"), data.get("users"), data.get("chat_id")
     if not msgs: return
 
-    await c.message.edit_text("🚀 <b>Запуск...</b>\n━━━━━━━━━━━━━━━━━━\n⏳ Не закрывайте окно.")
+    await c.message.edit_text(
+        "🚀 <b>Запуск...</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "⏳ Не закрывайте окно. Это займёт время."
+    )
 
     ok = block = fail = 0
+    
+    # Проверяем, есть ли плейсхолдеры в сообщениях
+    needs_personalization = any(
+        has_placeholders(msg.text) or has_placeholders(msg.caption)
+        for msg in msgs
+    )
+    
     for uid in users:
         try:
+            # Получаем информацию о пользователе если нужна персонализация
+            user_info = {}
+            if needs_personalization:
+                user_info = await get_user_info(bot, uid)
+                placeholders = build_placeholders(user_info)
+            
             for msg in msgs:
-                await bot.copy_message(uid, chat_id, msg.message_id)
+                msg_text = msg.text or msg.caption or ""
+                
+                if needs_personalization and has_placeholders(msg_text):
+                    # Персонализированная отправка
+                    placeholders = build_placeholders(user_info)
+                    personalized_text = personalize_text(msg_text, placeholders)
+                    
+                    if msg.content_type == ContentType.TEXT:
+                        # Текстовое сообщение
+                        try:
+                            await bot.send_message(uid, personalized_text, parse_mode="HTML")
+                        except TelegramBadRequest as e:
+                            if "can't parse" in str(e).lower():
+                                await bot.send_message(uid, personalized_text)
+                            else:
+                                raise
+                    
+                    elif msg.content_type == ContentType.PHOTO:
+                        try:
+                            await bot.send_photo(
+                                uid, msg.photo[-1].file_id,
+                                caption=personalized_text, parse_mode="HTML"
+                            )
+                        except TelegramBadRequest as e:
+                            if "can't parse" in str(e).lower():
+                                await bot.send_photo(uid, msg.photo[-1].file_id, caption=personalized_text)
+                            else:
+                                raise
+                    
+                    elif msg.content_type == ContentType.VIDEO:
+                        try:
+                            await bot.send_video(
+                                uid, msg.video.file_id,
+                                caption=personalized_text, parse_mode="HTML"
+                            )
+                        except TelegramBadRequest as e:
+                            if "can't parse" in str(e).lower():
+                                await bot.send_video(uid, msg.video.file_id, caption=personalized_text)
+                            else:
+                                raise
+                    
+                    elif msg.content_type == ContentType.DOCUMENT:
+                        try:
+                            await bot.send_document(
+                                uid, msg.document.file_id,
+                                caption=personalized_text, parse_mode="HTML"
+                            )
+                        except TelegramBadRequest as e:
+                            if "can't parse" in str(e).lower():
+                                await bot.send_document(uid, msg.document.file_id, caption=personalized_text)
+                            else:
+                                raise
+                    
+                    elif msg.content_type == ContentType.AUDIO:
+                        try:
+                            await bot.send_audio(
+                                uid, msg.audio.file_id,
+                                caption=personalized_text, parse_mode="HTML"
+                            )
+                        except TelegramBadRequest as e:
+                            if "can't parse" in str(e).lower():
+                                await bot.send_audio(uid, msg.audio.file_id, caption=personalized_text)
+                            else:
+                                raise
+                    
+                    elif msg.content_type == ContentType.ANIMATION:
+                        try:
+                            await bot.send_animation(
+                                uid, msg.animation.file_id,
+                                caption=personalized_text, parse_mode="HTML"
+                            )
+                        except TelegramBadRequest as e:
+                            if "can't parse" in str(e).lower():
+                                await bot.send_animation(uid, msg.animation.file_id, caption=personalized_text)
+                            else:
+                                raise
+                    
+                    elif msg.content_type == ContentType.VOICE:
+                        await bot.send_voice(uid, msg.voice.file_id)
+                    
+                    elif msg.content_type == ContentType.VIDEO_NOTE:
+                        await bot.send_video_note(uid, msg.video_note.file_id)
+                    
+                    elif msg.content_type == ContentType.STICKER:
+                        await bot.send_sticker(uid, msg.sticker.file_id)
+                    
+                    else:
+                        # Фоллбэк — обычное копирование
+                        await bot.copy_message(uid, chat_id, msg.message_id)
+                
+                else:
+                    # Без персонализации — просто копируем
+                    await bot.copy_message(uid, chat_id, msg.message_id)
+                
                 await asyncio.sleep(0.035)
             ok += 1
         except TelegramForbiddenError:
@@ -147,106 +390,68 @@ async def process_callback(c: types.CallbackQuery, state: FSMContext):
             fail += 1
 
     await c.message.edit_text(
-        f"✨ <b>Готово</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
+        "✨ <b>Рассылка завершена</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
         f"✅ Доставлено: <code>{ok}</code>\n"
         f"🚫 Заблокировали: <code>{block}</code>\n"
-        f"⚠️ Ошибки: <code>{fail}</code>"
+        f"⚠️ Ошибки: <code>{fail}</code>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "<i>Готово к следующей рассылке</i>",
+        parse_mode="HTML"
     )
     await state.clear()
 
-# ────────────── Webhook Handlers ──────────────
+# ────────────── Запуск (Render-Ready) ──────────────
 async def health_handler(request):
     return web.Response(text="OK")
 
 async def webhook_handler(request):
+    """Обработка входящих обновлений от Telegram"""
     try:
-        body = await request.text()
-        update = types.Update.model_validate_json(body)
-        await dp.feed_webhook_update(bot, update)
+        update = types.Update.model_dump_json(await request.text())
+        await dp.feed_webhook_update(bot, types.Update.model_validate_json(update))
         return web.Response(text="OK")
     except Exception as e:
-        logger.error(f"Webhook error: {e}")
+        print(f"Webhook error: {e}")
         return web.Response(text="Error", status=500)
 
 async def on_startup(app):
-    """Устанавливаем вебхук при старте"""
-    hostname = os.getenv("RENDER_EXTERNAL_HOSTNAME")
-    if not hostname:
-        logger.warning("⚠️ RENDER_EXTERNAL_HOSTNAME not set, using localhost")
-        hostname = "localhost"
-    
+    """Настройка вебхука при запуске"""
+    hostname = os.getenv("RENDER_EXTERNAL_HOSTNAME", "localhost")
     webhook_url = f"https://{hostname}/webhook"
     
-    try:
-        await bot.set_webhook(
-            webhook_url,
-            drop_pending_updates=True,
-            allowed_updates=dp.resolve_used_update_types()
-        )
-        logger.info(f"✅ Webhook set: {webhook_url}")
-    except Exception as e:
-        logger.error(f"❌ Failed to set webhook: {e}")
+    await bot.set_webhook(
+        webhook_url,
+        drop_pending_updates=True,  # Пропустить старые сообщения при рестарте
+        allowed_updates=dp.resolve_used_update_types()  # Только нужные апдейты
+    )
+    print(f"✅ Webhook set: {webhook_url}")
 
 async def on_shutdown(app):
-    """Удаляем вебхук при остановке"""
-    try:
-        await bot.delete_webhook()
-        logger.info("✅ Webhook deleted")
-    except Exception as e:
-        logger.error(f"❌ Failed to delete webhook: {e}")
+    """Очистка вебхука при остановке"""
+    await bot.delete_webhook()
+    print("✅ Webhook deleted")
 
-# ────────────── Main ──────────────
 async def main():
-    logger.info("🚀 Starting bot...")
-    
     await db_init()
-    logger.info("✅ Database initialized")
-    
-    # 🔥 ЯВНАЯ установка вебхука ПЕРЕД запуском сервера
-    hostname = os.getenv("RENDER_EXTERNAL_HOSTNAME")
-    if not hostname:
-        # Fallback: попробуем получить из Render-метаданных или используем дефолт
-        logger.warning("⚠️ RENDER_EXTERNAL_HOSTNAME not set, trying fallback...")
-        hostname = os.getenv("HOSTNAME", "localhost")
-    
-    webhook_url = f"https://{hostname}/webhook"
-    logger.info(f"🔗 Setting webhook to: {webhook_url}")
-    
-    try:
-        await bot.set_webhook(
-            webhook_url,
-            drop_pending_updates=True,
-            allowed_updates=dp.resolve_used_update_types()
-        )
-        logger.info(f"✅ Webhook SET successfully: {webhook_url}")
-    except Exception as e:
-        logger.error(f"❌ CRITICAL: Failed to set webhook: {e}")
-        # Не выходим, пусть сервер запустится — может, переменная подгрузится позже
-    
-    # Регистрация хендлеров (для корректного shutdown)
-    dp.startup.register(on_startup)  # Можно оставить, но теперь это дубль
+
+    # Регистрация хендлеров жизненного цикла
+    dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
-    
-    # Запуск веб-сервера
-    port = int(os.getenv("PORT", 8080))
+
+    # Настройка aiohttp приложения
     app = web.Application()
-    app.router.add_get("/health", health_handler)
-    app.router.add_post("/webhook", webhook_handler)
-    
+    app.router.add_get("/health", health_handler)      # Для Render/UptimeRobot
+    app.router.add_post("/webhook", webhook_handler)   # Для Telegram
+
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
+    await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 8080))).start()
+
+    print("🚀 Bot started (webhook mode)")
     
-    logger.info(f"✅ Server listening on port {port}")
-    logger.info(f"✅ Health check: https://{hostname}/health")
-    
-    # Держим процесс живым
+    # Держим процесс живым, пока не придёт сигнал остановки
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("👋 Bot stopped by user")
+    asyncio.run(main())
