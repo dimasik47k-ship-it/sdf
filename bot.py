@@ -1,17 +1,18 @@
 import asyncio
 import aiosqlite
 import os
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
-from aiogram.enums import ContentType
+from aiogram.enums import ContentType, ParseMode
+from aiogram.client.default import DefaultBotProperties
 from aiohttp import web
 import html
 
-# 🔐 Безопасная загрузка конфига из переменных окружения
+# 🔐 Безопасная загрузка конфига
 TOKEN = os.getenv("TOKEN")
 if not TOKEN:
     raise RuntimeError("❌ Переменная окружения TOKEN не найдена!")
@@ -22,205 +23,138 @@ if not ADMINS:
     raise RuntimeError("❌ Переменная окружения ADMINS не найдена! Формат: 123456789")
 
 DB = "users.db"
-bot = Bot(token=TOKEN)
+# Добавляем DefaultBotProperties для парсинга HTML по умолчанию
+bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 class Broadcast(StatesGroup):
     wait_msg = State()
 
-# ────────────── Утилиты ──────────────
-def build_placeholders(chat_info: dict) -> dict:
-    """
-    Строит словарь всех плейсхолдеров из информации о пользователе.
-    
-    Доступные плейсхолдеры:
-    {name} / {first_name} — имя пользователя (с заглавной первой буквой)
-    {last_name} — фамилия (если есть)
-    {full_name} — полное имя (имя + фамилия)
-    {username} — юзернейм (без @)
-    {username_at} — юзернейм с @
-    {id} — Telegram ID пользователя
-    {name:lower} / {first_name:lower} — имя строчными
-    {name:upper} / {first_name:upper} — имя заглавными
-    {last_name:lower} — фамилия строчными
-    {last_name:upper} — фамилия заглавными
-    {full_name:lower} — полное имя строчными
-    {full_name:upper} — полное имя заглавными
-    {premium} — True/False (подписка Telegram Premium)
-    {premium_emoji} — ⭐ / ☆ (иконка премиума)
-    {premium_badge} — 🌟 / "" (звёздочка для рассылки)
-    {is_bot} — True/False (является ли ботом)
-    {chat_id} — ID чата (совпадает с id для личных сообщений)
-    {chat_type} — private / public
-    {mention} — упоминание (через @ или имя)
-    {lang} — языковой код пользователя
-    """
-    first_name = chat_info.get("first_name", "Пользователь")
-    last_name = chat_info.get("last_name", "")
-    username = chat_info.get("username", "")
-    uid = chat_info.get("id", 0)
-    is_premium = chat_info.get("is_premium", False)
-    is_bot = chat_info.get("is_bot", False)
-    lang = chat_info.get("language_code", "")
-    full_name = f"{first_name} {last_name}".strip() if last_name else first_name
-    
-    # Определяем тип чата
-    chat_type = chat_info.get("chat_type", "private")
-    chat_type_display = "private" if chat_type == "private" else "public"
-    
-    # Mention
-    if username:
-        mention = f"@{username}"
-    else:
-        mention = first_name
-    
-    return {
-        # Имя
-        "{name}": first_name,
-        "{first_name}": first_name,
-        "{name:lower}": first_name.lower(),
-        "{first_name:lower}": first_name.lower(),
-        "{name:upper}": first_name.upper(),
-        "{first_name:upper}": first_name.upper(),
-        
-        # Фамилия
-        "{last_name}": last_name,
-        "{last_name:lower}": last_name.lower(),
-        "{last_name:upper}": last_name.upper(),
-        
-        # Полное имя
-        "{full_name}": full_name,
-        "{full_name:lower}": full_name.lower(),
-        "{full_name:upper}": full_name.upper(),
-        
-        # Юзернейм
-        "{username}": username,
-        "{username_at}": f"@{username}" if username else "",
-        
-        # ID
-        "{id}": str(uid),
-        "{chat_id}": str(uid),
-        
-        # Премиум
-        "{premium}": str(is_premium),
-        "{premium_emoji}": "⭐" if is_premium else "☆",
-        "{premium_badge}": "🌟" if is_premium else "",
-        
-        # Бот
-        "{is_bot}": str(is_bot),
-        
-        # Тип чата
-        "{chat_type}": chat_type_display,
-        
-        # Упоминание
-        "{mention}": mention,
-        
-        # Язык
-        "{lang}": lang,
-    }
-
-
-
-
-def personalize_text(text: str, placeholders: dict) -> str:
-    """
-    Заменяет все плейсхолдеры в тексте на значения.
-    1. Сортируем ключи по длине (убывание), чтобы {name:lower} заменился раньше {name}.
-    2. Экранируем значения для безопасной вставки в HTML.
-    """
-    if not text:
-        return text
-        
-    # Сортировка: сначала длинные плейсхолдеры
-    sorted_placeholders = sorted(placeholders.items(), key=lambda x: len(x[0]), reverse=True)
-    
-    for placeholder, value in sorted_placeholders:
-        # Экранируем HTML-символы в значении, чтобы не сломать разметку
-        safe_value = html.escape(str(value))
-        text = text.replace(placeholder, safe_value)
-    return text
-
-
-async def get_user_info(bot: Bot, uid: int) -> dict:
-    """Получает полнуюбую информацию о пользователе."""
-    try:
-        chat = await bot.get_chat(uid)
-        return {
-            "id": chat.id,
-            "first_name": chat.first_name or "",
-            "last_name": chat.last_name or "",
-            "username": chat.username or "",
-            "is_premium": chat.is_premium_user or False,
-            "is_bot": chat.is_bot or False,
-            "language_code": chat.language_code or "",
-            "chat_type": chat.type or "private",
-        }
-    except Exception:
-        return {
-            "id": uid,
-            "first_name": "Пользователь",
-            "last_name": "",
-            "username": "",
-            "is_premium": False,
-            "is_bot": False,
-            "language_code": "",
-            "chat_type": "private",
-        }
-
-
-ALL_PLACEHOLDERS = [
-    "{name}", "{first_name}", "{name:lower}", "{first_name:lower}",
-    "{name:upper}", "{first_name:upper}", "{last_name}", "{last_name:lower}",
-    "{last_name:upper}", "{full_name}", "{full_name:lower}", "{full_name:upper}",
-    "{username}", "{username_at}", "{id}", "{chat_id}", "{premium}",
-    "{premium_emoji}", "{premium_badge}", "{is_bot}", "{chat_type}",
-    "{mention}", "{lang}",
-]
-
-
-def has_placeholders(text: str) -> bool:
-    """Проверяет, есть ли в тексте плейсхолдеры."""
-    if not text:
-        return False
-    return any(ph in text for ph in ALL_PLACEHOLDERS)
-
 # ────────────── БД ──────────────
 async def db_init():
     async with aiosqlite.connect(DB) as db:
-        await db.execute("CREATE TABLE IF NOT EXISTS subs (uid INTEGER PRIMARY KEY)")
+        # Сохраняем все нужные данные при старте, чтобы не дергать API при рассылке
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS subs (
+                uid INTEGER PRIMARY KEY,
+                first_name TEXT,
+                last_name TEXT,
+                username TEXT,
+                language_code TEXT,
+                is_premium BOOLEAN,
+                is_bot BOOLEAN
+            )
+        """)
         await db.commit()
 
-async def db_add_if_new(uid):
+async def db_add_user(user: types.User):
     async with aiosqlite.connect(DB) as db:
-        cur = await db.execute("SELECT 1 FROM subs WHERE uid = ?", (uid,))
-        if await cur.fetchone(): return False
-        await db.execute("INSERT INTO subs VALUES (?)", (uid,))
+        cur = await db.execute("SELECT 1 FROM subs WHERE uid = ?", (user.id,))
+        is_new = not await cur.fetchone()
+        
+        # Вставляем или обновляем данные пользователя
+        await db.execute("""
+            INSERT INTO subs (uid, first_name, last_name, username, language_code, is_premium, is_bot)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(uid) DO UPDATE SET
+                first_name=excluded.first_name,
+                last_name=excluded.last_name,
+                username=excluded.username,
+                language_code=excluded.language_code,
+                is_premium=excluded.is_premium
+        """, (
+            user.id, user.first_name or "", user.last_name or "", 
+            user.username or "", user.language_code or "", 
+            user.is_premium or False, user.is_bot or False
+        ))
         await db.commit()
-        return True
+        return is_new
 
-async def db_get():
+async def db_get_users():
     async with aiosqlite.connect(DB) as db:
-        async with db.execute("SELECT uid FROM subs") as cur:
-            return [r[0] for r in await cur.fetchall()]
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM subs") as cur:
+            # Возвращаем список словарей с данными пользователей
+            return [dict(row) for row in await cur.fetchall()]
 
-async def db_remove(uid):
+async def db_remove(uid: int):
     async with aiosqlite.connect(DB) as db:
         await db.execute("DELETE FROM subs WHERE uid = ?", (uid,))
         await db.commit()
 
+
+# ────────────── Утилиты для текста ──────────────
+def build_placeholders(user_info: dict) -> dict:
+    first_name = user_info.get("first_name", "Пользователь")
+    last_name = user_info.get("last_name", "")
+    username = user_info.get("username", "")
+    uid = user_info.get("uid", 0)
+    is_premium = bool(user_info.get("is_premium", False))
+    is_bot = bool(user_info.get("is_bot", False))
+    lang = user_info.get("language_code", "")
+    full_name = f"{first_name} {last_name}".strip() if last_name else first_name
+    
+    # Кликабельное упоминание (имя с ссылкой на профиль), если нет юзернейма
+    if username:
+        mention = f"@{username}"
+    else:
+        mention = f'<a href="tg://user?id={uid}">{html.escape(first_name)}</a>'
+    
+    return {
+        "{name}": first_name,
+        "{first_name}": first_name,
+        "{name:lower}": first_name.lower(),
+        "{last_name}": last_name,
+        "{full_name}": full_name,
+        "{username}": username,
+        "{username_at}": f"@{username}" if username else "",
+        "{id}": str(uid),
+        "{chat_id}": str(uid),
+        "{premium}": str(is_premium),
+        "{premium_emoji}": "⭐" if is_premium else "☆",
+        "{is_bot}": str(is_bot),
+        "{mention}": mention,
+        "{lang}": lang,
+    }
+
+def personalize_text(text: str, placeholders: dict) -> str:
+    if not text:
+        return text
+    
+    sorted_placeholders = sorted(placeholders.items(), key=lambda x: len(x[0]), reverse=True)
+    for placeholder, value in sorted_placeholders:
+        # Не экранируем {mention}, так как он уже содержит валидный HTML
+        if placeholder == "{mention}":
+            text = text.replace(placeholder, str(value))
+        else:
+            safe_value = html.escape(str(value))
+            text = text.replace(placeholder, safe_value)
+    return text
+
+ALL_PLACEHOLDERS = ["{name}", "{first_name}", "{last_name}", "{full_name}", "{username}", 
+                    "{username_at}", "{id}", "{chat_id}", "{premium}", "{premium_emoji}", 
+                    "{is_bot}", "{mention}", "{lang}"]
+
+def has_placeholders(text: str) -> bool:
+    if not text: return False
+    return any(ph in text for ph in ALL_PLACEHOLDERS)
+
+
 # ────────────── Хендлеры ──────────────
 @dp.message(Command("start"))
 async def cmd_start(m: types.Message):
-    if await db_add_if_new(m.from_user.id):
+    is_new = await db_add_user(m.from_user)
+    if is_new:
         await m.answer(
             "✨ <b>Добро пожаловать!</b>\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "📩 Вы подписаны на рассылку.\n"
             "🔔 Уведомления будут приходить сюда.\n"
             "━━━━━━━━━━━━━━━━━━\n"
-            "<i>Ожидайте важные обновления!</i>",
-            parse_mode="HTML"
+            "<i>Ожидайте важные обновления!</i>"
         )
+    else:
+        await m.answer("✅ Данные обновлены. Вы уже подписаны на рассылку.")
 
 @dp.message(Command("ms"))
 async def cmd_ms(m: types.Message, state: FSMContext):
@@ -229,9 +163,7 @@ async def cmd_ms(m: types.Message, state: FSMContext):
         "📤 <b>Режим рассылки</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "Отправьте сообщение боту.\n"
-        "✅ Поддерживается: текст, стикеры, GIF, видео,\n"
-        "   голосовые, альбомы, премиум-эмодзи.",
-        parse_mode="HTML"
+        "⚠️ <i>Медиагруппы (альбомы) в режиме рассылки с плейсхолдерами отправляются по одному фото. Для альбома лучше использовать рассылку без переменных.</i>"
     )
     await state.set_state(Broadcast.wait_msg)
 
@@ -240,14 +172,9 @@ async def handle_broadcast(m: types.Message, state: FSMContext):
     if m.from_user.id not in ADMINS: return
     await state.clear()
 
-    users = await db_get()
+    users = await db_get_users()
     if not users:
-        return await m.answer("❌ <b>Нет подписчиков</b>", parse_mode="HTML")
-
-    msgs = [m]
-    if m.media_group_id:
-        history = await bot.get_chat_history(m.chat.id, limit=20)
-        msgs = sorted([x for x in history if x.media_group_id == m.media_group_id], key=lambda x: x.date)
+        return await m.answer("❌ <b>Нет подписчиков</b>")
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Отправить всем", callback_data="bc_confirm")],
@@ -258,151 +185,73 @@ async def handle_broadcast(m: types.Message, state: FSMContext):
         f"📋 <b>Предпросмотр рассылки</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"👥 Подписчиков: <code>{len(users)}</code>\n"
-        f"📦 Сообщений: <code>{len(msgs)}</code>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"Подтвердите отправку:",
-        reply_markup=kb,
-        parse_mode="HTML"
+        reply_markup=kb
     )
-    await state.update_data(msgs=msgs, users=users, chat_id=m.chat.id)
+    
+    # Сохраняем ID сообщения для копирования (если нет плейсхолдеров)
+    await state.update_data(msg_id=m.message_id, chat_id=m.chat.id, users=users)
 
-@dp.callback_query(lambda c: c.data.startswith("bc_"))
+@dp.callback_query(F.data.startswith("bc_"))
 async def process_callback(c: types.CallbackQuery, state: FSMContext):
     await c.answer()
     data = await state.get_data()
     
     if c.data == "bc_cancel":
-        await c.message.edit_text("🛑 <b>Рассылка отменена</b>", parse_mode="HTML")
+        await c.message.edit_text("🛑 <b>Рассылка отменена</b>")
         await state.clear()
         return
 
-    msgs, users, chat_id = data.get("msgs"), data.get("users"), data.get("chat_id")
-    if not msgs: return
+    msg_id = data.get("msg_id")
+    chat_id = data.get("chat_id")
+    users = data.get("users")
+    if not msg_id: return
 
-    await c.message.edit_text(
-        "🚀 <b>Запуск...</b>\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "⏳ Не закрывайте окно. Это займёт время."
-    )
+    # Получаем само сообщение для анализа
+    try:
+        msg = await bot.forward_message(chat_id=chat_id, from_chat_id=chat_id, message_id=msg_id)
+        await msg.delete() # Удаляем форвард, нам нужен был только объект сообщения
+    except Exception:
+        await c.message.edit_text("❌ Ошибка: не удалось получить оригинальное сообщение.")
+        return
+
+    await c.message.edit_text("🚀 <b>Запуск...</b>\n━━━━━━━━━━━━━━━━━━\n⏳ Не закрывайте окно.")
 
     ok = block = fail = 0
     
-    # Проверяем, есть ли плейсхолдеры в сообщениях
-    needs_personalization = any(
-        has_placeholders(msg.text) or has_placeholders(msg.caption)
-        for msg in msgs
-    )
+    # Aiogram 3: html_text сохраняет всё форматирование (жирный, ссылки и т.д.)
+    original_html_text = msg.html_text if hasattr(msg, 'html_text') and msg.html_text else ""
+    needs_personalization = has_placeholders(original_html_text)
     
-        # ... (код до цикла for uid in users) ...
-    
-    for uid in users:
+    for user in users:
+        uid = user["uid"]
         try:
-            # Получаем инфо пользователя только если есть плейсхолдеры
-            placeholders = {}
-            if needs_personalization:
-                user_info = await get_user_info(bot, uid)
-                placeholders = build_placeholders(user_info)
-            
-            # Определяем, является ли текущая пачка сообщений медиа-группой
-            is_media_group = len(msgs) > 1 and msgs[0].media_group_id
-            
-            # Если это альбом, готовим группу для отправки (aiogram 3.x)
-            if is_media_group and needs_personalization:
-                from aiogram.types import InputMediaPhoto, InputMediaVideo, InputMediaAudio, InputMediaDocument
-                media_group = []
-                
-                for msg in msgs:
-                    original_text = msg.text or msg.caption or ""
-                    new_caption = personalize_text(original_text, placeholders) if has_placeholders(original_text) else original_text
-                    
-                    # Формируем объекты InputMedia* с новыми подписями
-                    if msg.content_type == ContentType.PHOTO:
-                        media_group.append(InputMediaPhoto(media=msg.photo[-1].file_id, caption=new_caption, parse_mode="HTML"))
-                    elif msg.content_type == ContentType.VIDEO:
-                        media_group.append(InputMediaVideo(media=msg.video.file_id, caption=new_caption, parse_mode="HTML"))
-                    elif msg.content_type == ContentType.DOCUMENT:
-                        media_group.append(InputMediaDocument(media=msg.document.file_id, caption=new_caption, parse_mode="HTML"))
-                    elif msg.content_type == ContentType.AUDIO:
-                        media_group.append(InputMediaAudio(media=msg.audio.file_id, caption=new_caption, parse_mode="HTML"))
-                    else:
-                        # Если тип не поддерживается в альбоме, отправим отдельно ниже
-                        media_group = None 
-                        break
-                
-                if media_group:
-                    try:
-                        await bot.send_media_group(uid, media_group)
-                        await asyncio.sleep(0.035)
-                        continue # Переходим к следующему пользователю
-                    except Exception as e:
-                        print(f"Error sending media group to {uid}: {e}")
-                        # Фоллбэк: отправлять по одному, если группа не прошла
+            if not needs_personalization:
+                # САМЫЙ НАДЕЖНЫЙ МЕТОД: Если плейсхолдеров нет, просто копируем сообщение
+                # Это сохранит кнопки, форматирование, скрытый текст и т.д.
+                await bot.copy_message(chat_id=uid, from_chat_id=chat_id, message_id=msg_id)
+            else:
+                # Если нужны плейсхолдеры, собираем их из данных БД
+                placeholders = build_placeholders(user)
+                final_text = personalize_text(original_html_text, placeholders)
 
-            # --- Стандартная отправка (одиночные сообщения или фоллбэк) ---
-            for msg in msgs:
-                original_text = msg.text or msg.caption or ""
-                
-                # Определяем финальный текст и parse_mode
-                if needs_personalization and has_placeholders(original_text):
-                    final_text = personalize_text(original_text, placeholders)
-                    parse_mode = "HTML"
+                if msg.content_type == ContentType.TEXT:
+                    await bot.send_message(uid, final_text)
+                elif msg.content_type == ContentType.PHOTO:
+                    await bot.send_photo(uid, msg.photo[-1].file_id, caption=final_text)
+                elif msg.content_type == ContentType.VIDEO:
+                    await bot.send_video(uid, msg.video.file_id, caption=final_text)
+                elif msg.content_type == ContentType.DOCUMENT:
+                    await bot.send_document(uid, msg.document.file_id, caption=final_text)
+                elif msg.content_type == ContentType.ANIMATION:
+                    await bot.send_animation(uid, msg.animation.file_id, caption=final_text)
                 else:
-                    # Если персонализация не нужна, копируем как есть
-                    final_text = original_text
-                    parse_mode = msg.parse_mode if hasattr(msg, 'parse_mode') else None
+                    # Фоллбек для голосовых, кружков и стикеров (не поддерживают текст с плейсхолдерами)
+                    await bot.copy_message(chat_id=uid, from_chat_id=chat_id, message_id=msg_id)
 
-                try:
-                    if msg.content_type == ContentType.TEXT:
-                        await bot.send_message(uid, final_text, parse_mode=parse_mode)
-                    
-                    elif msg.content_type == ContentType.PHOTO:
-                        await bot.send_photo(uid, msg.photo[-1].file_id, caption=final_text, parse_mode=parse_mode)
-                    
-                    elif msg.content_type == ContentType.VIDEO:
-                        await bot.send_video(uid, msg.video.file_id, caption=final_text, parse_mode=parse_mode)
-                    
-                    elif msg.content_type == ContentType.DOCUMENT:
-                        await bot.send_document(uid, msg.document.file_id, caption=final_text, parse_mode=parse_mode)
-                    
-                    elif msg.content_type == ContentType.AUDIO:
-                        await bot.send_audio(uid, msg.audio.file_id, caption=final_text, parse_mode=parse_mode)
-                    
-                    elif msg.content_type == ContentType.ANIMATION: # GIF
-                        await bot.send_animation(uid, msg.animation.file_id, caption=final_text, parse_mode=parse_mode)
-                    
-                    elif msg.content_type == ContentType.VOICE:
-                        # Голосовые не поддерживают подписи с HTML, отправляем как есть
-                        await bot.send_voice(uid, msg.voice.file_id)
-                    
-                    elif msg.content_type == ContentType.VIDEO_NOTE:
-                        await bot.send_video_note(uid, msg.video_note.file_id)
-                    
-                    elif msg.content_type == ContentType.STICKER:
-                        await bot.send_sticker(uid, msg.sticker.file_id)
-                    
-                    else:
-                        # Для всех остальных типов (контакты, геометрия и т.д.) 
-                        # персонализация текста невозможна через API, используем copy
-                        await bot.copy_message(uid, chat_id, msg.message_id)
-                    
-                    # Небольшая задержка, чтобы не словить лимиты (429)
-                    await asyncio.sleep(0.035)
-                    
-                except TelegramBadRequest as e:
-                    # Если HTML не валиден (редкий кейс), пробуем отправить без парсинга
-                    if "can't parse" in str(e).lower() and parse_mode:
-                        if msg.content_type == ContentType.PHOTO:
-                            await bot.send_photo(uid, msg.photo[-1].file_id, caption=final_text)
-                        elif msg.content_type == ContentType.VIDEO:
-                            await bot.send_video(uid, msg.video.file_id, caption=final_text)
-                        elif msg.content_type == ContentType.TEXT:
-                            await bot.send_message(uid, final_text)
-                        else:
-                            await bot.copy_message(uid, chat_id, msg.message_id)
-                    else:
-                        raise
-                        
             ok += 1
+            await asyncio.sleep(0.035) # ~28 сообщений в секунду, безопасно для лимитов
             
         except TelegramForbiddenError:
             block += 1
@@ -415,26 +264,22 @@ async def process_callback(c: types.CallbackQuery, state: FSMContext):
         "✨ <b>Рассылка завершена</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"✅ Доставлено: <code>{ok}</code>\n"
-        f"🚫 Заблокировали: <code>{block}</code>\n"
+        f"🚫 Заблокировали бота: <code>{block}</code>\n"
         f"⚠️ Ошибки: <code>{fail}</code>\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "<i>Готово к следующей рассылке</i>",
-        parse_mode="HTML"
+        "<i>Готово к следующей рассылке</i>"
     )
     await state.clear()
 
-# ────────────── Запуск (Render-Ready) ──────────────
+
+# ────────────── Webhook и запуск (Render-Ready) ──────────────
 async def health_handler(request):
     return web.Response(text="OK")
 
 async def webhook_handler(request: web.Request):
-    """Обработка входящих обновлений от Telegram"""
     try:
-        # 1. Получаем данные как словарь (dict)
         data = await request.json()
-        # 2. Валидируем в объект aiogram
-        update = types.Update.model_validate(data)
-        # 3. Передаём в диспетчер
+        update = types.Update.model_validate(data, context={"bot": bot})
         await dp.feed_webhook_update(bot, update)
         return web.Response(text="OK")
     except Exception as e:
@@ -442,11 +287,9 @@ async def webhook_handler(request: web.Request):
         return web.Response(text="Error", status=500)
 
 async def on_startup(app):
-    """Настройка вебхука при запуске"""
     hostname = os.getenv("RENDER_EXTERNAL_HOSTNAME")
     if not hostname:
-        # ❗ Лучше упасть с ошибкой, чем ставить вебхук на localhost
-        raise RuntimeError("❌ RENDER_EXTERNAL_HOSTNAME не найден! Бот не может настроить вебхук.")
+        raise RuntimeError("❌ RENDER_EXTERNAL_HOSTNAME не найден!")
     
     webhook_url = f"https://{hostname}/webhook"
     
@@ -458,29 +301,26 @@ async def on_startup(app):
     print(f"✅ Webhook set: {webhook_url}")
 
 async def on_shutdown(app):
-    """Очистка вебхука при остановке"""
     await bot.delete_webhook()
     print("✅ Webhook deleted")
 
 async def main():
     await db_init()
 
-    # Регистрация хендлеров жизненного цикла
-    dp.startup.register(on_startup)
-    dp.shutdown.register(on_shutdown)
-
-    # Настройка aiohttp приложения
+    # Настройка aiohttp
     app = web.Application()
-    app.router.add_get("/health", health_handler)      # Для Render/UptimeRobot
-    app.router.add_post("/webhook", webhook_handler)   # Для Telegram
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_shutdown)
+    
+    app.router.add_get("/health", health_handler)      
+    app.router.add_post("/webhook", webhook_handler)   
 
     runner = web.AppRunner(app)
     await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 8080))).start()
+    port = int(os.getenv("PORT", 8080))
+    await web.TCPSite(runner, "0.0.0.0", port).start()
 
-    print("🚀 Bot started (webhook mode)")
-    
-    # Держим процесс живым, пока не придёт сигнал остановки
+    print(f"🚀 Bot started on port {port}")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
